@@ -35,17 +35,24 @@ spender, which may itself be a coordinating contract.
 ## ERC-20 example
 
 [`ERC20Lockable`](contracts/ERC20Lockable.sol) is a transparent ERC-20 token
-(based on OpenZeppelin) that implements `IERC8316`. A lock reserves part of the owner's
-balance for transfer to a fixed recipient:
+(based on OpenZeppelin) that implements `IERC8316`. A lock is one of three kinds:
+
+| Kind | Created by | Reserves | Spend | Cancel |
+| --- | --- | --- | --- | --- |
+| Transfer | `createLock`, the holder | the holder's balance | transfers it to the recipient | releases the reservation |
+| Burn | `createBurnLock`, the holder | the holder's balance | burns it | releases the reservation |
+| Mint | `createMintLock`, the token owner | nothing | mints the amount to the recipient | drops the lock |
 
 - **Locked balances** are a subset of the total balance and cannot be moved by
   ordinary transfers (enforced in the `_update` hook).
-- **Spending a lock** transfers the reserved amount to the recipient, while **cancel** releases
-  the reservation back to the owner. Either path may be delegated to a
-  coordinator.
+- Spend and cancel may be delegated to a coordinator.
 
 Because the token is fully transparent, the operation is entirely determined by
-the lock content (amount and recipient) captured at creation. There is no hidden
+the lock content (kind, amount and recipient) captured at creation. Two
+extensions outside ERC-8316 expose it: `getLockContent` returns it while the
+lock is active, as `ERC20LockContent(uint8 kind,uint256 amount,address recipient)`
+behind its ERC-8074 selector, and `ERC20LockCreated(lockId, owner, kind, amount, recipient, data)`,
+emitted after `LockCreated`, records it for indexers. There is no hidden
 state to bind, so this example leaves the commitments unrestricted (zero) and
 performs no commitment validation. A privacy-preserving implementation would
 instead bind proofs, encrypted values, or nullifiers into the commitments and
