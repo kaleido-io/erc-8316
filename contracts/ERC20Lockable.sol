@@ -11,15 +11,20 @@ import "./interfaces/IERC8316.sol";
  * @dev A transparent ERC-20 token that implements ERC-8316 (Programmable
  *      Settlement Locks) for balance locking.
  *
- *      A lock reserves an amount of the owner's balance for transfer to a
- *      fixed recipient. The current spender may spend the lock (transferring
- *      the amount to the recipient) or cancel it (releasing the reservation
- *      back to the owner). Locked balances are tracked as a subset of the
- *      owner's total balance and cannot be moved by ordinary transfers.
+ *      A lock is one of three kinds:
+ *      - Transfer: reserves an amount of the owner's balance for transfer to
+ *        a fixed recipient.
+ *      - Burn: reserves an amount of a holder's balance for burning.
+ *      - Mint: fixes a mint of an amount to a recipient.
+ *      The current spender may spend the lock (performing its operation) or
+ *      cancel it (releasing any reservation back to the owner). Locked
+ *      balances are tracked as a subset of the owner's total balance and
+ *      cannot be moved by ordinary transfers.
  *
  *      Because the underlying token is fully transparent, the operation is
- *      completely determined by the lock content (amount and recipient)
- *      captured at creation. There is no hidden state to bind, so this example
+ *      completely determined by the lock content (kind, amount and recipient)
+ *      captured at creation, which ERC20LockCreated states alongside the
+ *      standard LockCreated. There is no hidden state to bind, so this example
  *      leaves `spendCommitment` and `cancelCommitment` unrestricted (zero) and
  *      performs no commitment validation in spendLock/cancelLock. A
  *      privacy-preserving implementation would instead bind proofs, encrypted
@@ -32,10 +37,22 @@ contract ERC20Lockable is ERC20, ERC20Burnable, Ownable, IERC8316 {
         address recipient;
     }
 
+    enum LockKind {
+        Transfer,
+        Burn,
+        Mint
+    }
+
+    struct LockContent {
+        LockKind kind;
+        uint256 amount;
+        address recipient; // zero for a burn
+    }
+
     struct TokenLock {
         address owner;
         address spender;
-        CreateLockInputs content;
+        LockContent content;
         bytes32 spendCommitment;
         bytes32 cancelCommitment;
         bool active;
@@ -43,9 +60,9 @@ contract ERC20Lockable is ERC20, ERC20Burnable, Ownable, IERC8316 {
 
     // Type selector for the bytes returned by getLockContent (an
     // implementation-specific extension, ERC-8074 encoded).
-    // bytes4(keccak256("ERC20LockContent(uint256 amount,address recipient)"))
+    // bytes4(keccak256("ERC20LockContent(uint8 kind,uint256 amount,address recipient)"))
     string public constant ERC20LockContentType =
-        "ERC20LockContent(uint256 amount,address recipient)";
+        "ERC20LockContent(uint8 kind,uint256 amount,address recipient)";
     bytes4 public constant ERC20LockContentSelector =
         bytes4(keccak256(bytes(ERC20LockContentType)));
 
@@ -53,7 +70,21 @@ contract ERC20Lockable is ERC20, ERC20Burnable, Ownable, IERC8316 {
     mapping(address => uint256) private _lockedBalances;
     uint256 private _lockCounter;
 
+    /**
+     * @dev Emitted after LockCreated, with the lock's content.
+     *      An implementation-specific extension.
+     */
+    event ERC20LockCreated(
+        bytes32 indexed lockId,
+        address indexed owner,
+        LockKind indexed kind,
+        uint256 amount,
+        address recipient,
+        bytes data
+    );
+
     error InvalidAmount(uint256 amount);
+    error InvalidRecipient(address recipient);
 
     constructor(
         string memory name,
@@ -109,36 +140,107 @@ contract ERC20Lockable is ERC20, ERC20Burnable, Ownable, IERC8316 {
         bytes calldata data
     ) external returns (bytes32 lockId) {
         CreateLockInputs memory inputs = abi.decode(createArgs, (CreateLockInputs));
-        require(inputs.amount > 0, InvalidAmount(inputs.amount));
+        require(inputs.recipient != address(0), InvalidRecipient(inputs.recipient));
+        _reserve(msg.sender, inputs.amount);
+        lockId = _newLock(
+            msg.sender,
+            msg.sender,
+            LockContent(LockKind.Transfer, inputs.amount, inputs.recipient),
+            spendCommitment,
+            cancelCommitment,
+            data
+        );
+    }
 
-        uint256 unlockedBalance = balanceOf(msg.sender) -
-            _lockedBalances[msg.sender];
+    /**
+     * @dev Create a lock reserving `amount` of the caller's balance for burning.
+     */
+    function createBurnLock(
+        uint256 amount,
+        bytes32 spendCommitment,
+        bytes32 cancelCommitment,
+        bytes calldata data
+    ) external returns (bytes32 lockId) {
+        _reserve(msg.sender, amount);
+        lockId = _newLock(
+            msg.sender,
+            msg.sender,
+            LockContent(LockKind.Burn, amount, address(0)),
+            spendCommitment,
+            cancelCommitment,
+            data
+        );
+    }
+
+    /**
+     * @dev Create a lock fixing a mint of `amount` to `to`, made when the lock
+     *      is spent. The caller, the token owner, owns the lock.
+     */
+    function createMintLock(
+        address to,
+        uint256 amount,
+        bytes32 spendCommitment,
+        bytes32 cancelCommitment,
+        bytes calldata data
+    ) external onlyOwner returns (bytes32 lockId) {
+        require(amount > 0, InvalidAmount(amount));
+        require(to != address(0), InvalidRecipient(to));
+        lockId = _newLock(
+            msg.sender,
+            msg.sender,
+            LockContent(LockKind.Mint, amount, to),
+            spendCommitment,
+            cancelCommitment,
+            data
+        );
+    }
+
+    /**
+     * @dev Reserve `amount` of `holder`'s unlocked balance.
+     */
+    function _reserve(address holder, uint256 amount) private {
+        require(amount > 0, InvalidAmount(amount));
+        uint256 unlockedBalance = balanceOf(holder) - _lockedBalances[holder];
         require(
-            inputs.amount <= unlockedBalance,
-            ERC20InsufficientBalance(msg.sender, unlockedBalance, inputs.amount)
+            amount <= unlockedBalance,
+            ERC20InsufficientBalance(holder, unlockedBalance, amount)
         );
+        _lockedBalances[holder] += amount;
+    }
 
-        lockId = keccak256(
-            abi.encode(address(this), msg.sender, ++_lockCounter)
-        );
+    function _newLock(
+        address owner,
+        address spender,
+        LockContent memory content,
+        bytes32 spendCommitment,
+        bytes32 cancelCommitment,
+        bytes calldata data
+    ) private returns (bytes32 lockId) {
+        lockId = keccak256(abi.encode(address(this), owner, ++_lockCounter));
 
         _locks[lockId] = TokenLock({
-            owner: msg.sender,
-            spender: msg.sender,
-            content: inputs,
+            owner: owner,
+            spender: spender,
+            content: content,
             spendCommitment: spendCommitment,
             cancelCommitment: cancelCommitment,
             active: true
         });
 
-        _lockedBalances[msg.sender] += inputs.amount;
-
         emit LockCreated(
             lockId,
-            msg.sender,
-            msg.sender,
+            owner,
+            spender,
             spendCommitment,
             cancelCommitment,
+            data
+        );
+        emit ERC20LockCreated(
+            lockId,
+            owner,
+            content.kind,
+            content.amount,
+            content.recipient,
             data
         );
     }
@@ -200,7 +302,7 @@ contract ERC20Lockable is ERC20, ERC20Burnable, Ownable, IERC8316 {
     }
 
     /**
-     * @dev Spend the locked tokens (transfer to the recipient).
+     * @dev Spend the lock: transfer to the recipient, burn, or mint.
      */
     function spendLock(
         bytes32 lockId,
@@ -214,22 +316,29 @@ contract ERC20Lockable is ERC20, ERC20Burnable, Ownable, IERC8316 {
             LockUnauthorized(lockId, lock.spender, msg.sender)
         );
 
-        uint256 amount = lock.content.amount;
+        LockContent memory content = lock.content;
         address owner = lock.owner;
-        address recipient = lock.content.recipient;
 
         // Update state before the transfer (which may reenter) per ERC-8316
         // implementation-safety guidance.
-        _lockedBalances[owner] -= amount;
+        if (content.kind != LockKind.Mint) {
+            _lockedBalances[owner] -= content.amount;
+        }
         delete _locks[lockId];
 
-        _transfer(owner, recipient, amount);
+        if (content.kind == LockKind.Transfer) {
+            _transfer(owner, content.recipient, content.amount);
+        } else if (content.kind == LockKind.Burn) {
+            _burn(owner, content.amount);
+        } else {
+            _mint(content.recipient, content.amount);
+        }
 
         emit LockSpent(lockId, msg.sender, data);
     }
 
     /**
-     * @dev Cancel the lock, releasing the reserved tokens back to the owner.
+     * @dev Cancel the lock, releasing any reserved tokens back to the owner.
      */
     function cancelLock(
         bytes32 lockId,
@@ -243,7 +352,9 @@ contract ERC20Lockable is ERC20, ERC20Burnable, Ownable, IERC8316 {
             LockUnauthorized(lockId, lock.spender, msg.sender)
         );
 
-        _lockedBalances[lock.owner] -= lock.content.amount;
+        if (lock.content.kind != LockKind.Mint) {
+            _lockedBalances[lock.owner] -= lock.content.amount;
+        }
         delete _locks[lockId];
 
         emit LockCancelled(lockId, msg.sender, data);
@@ -265,7 +376,7 @@ contract ERC20Lockable is ERC20, ERC20Burnable, Ownable, IERC8316 {
     }
 
     /**
-     * @dev Get the implementation-specific lock content (amount and recipient),
+     * @dev Get the implementation-specific lock content (kind, amount and recipient),
      *      prefixed with a type selector. This is an extension (not included in ERC-8316).
      */
     function getLockContent(

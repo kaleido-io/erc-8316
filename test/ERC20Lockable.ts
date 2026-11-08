@@ -1,12 +1,14 @@
 import { expect } from "chai";
-import type { Signer } from "ethers";
+import type { ContractTransactionResponse, Signer } from "ethers";
 import { ethers } from "hardhat";
 import type { ERC20Lockable } from "../typechain-types";
 import {
   createTokenLock,
+  decodeLockContent,
   encodeCreateLockInputs,
-  ERC20_CREATE_LOCK_INPUTS_TYPE,
   ERC20_LOCK_CONTENT_TYPE,
+  lockIdOf,
+  LockKind,
 } from "./helpers/erc20-lockable";
 
 describe("ERC20Lockable (ERC-8316 example)", function () {
@@ -84,15 +86,43 @@ describe("ERC20Lockable (ERC-8316 example)", function () {
       expect(lockInfo.owner).to.equal(aliceAddress);
       expect(lockInfo.spender).to.equal(aliceAddress);
 
-      const content = await token.getLockContent(lockId);
-      const expectedSelector = ethers.id(ERC20_LOCK_CONTENT_TYPE).slice(0, 10);
-      expect(content.slice(0, 10)).to.equal(expectedSelector);
-      const [inputs] = ethers.AbiCoder.defaultAbiCoder().decode(
-        [ERC20_CREATE_LOCK_INPUTS_TYPE],
-        "0x" + content.slice(10),
-      );
-      expect(inputs.amount).to.equal(amount);
-      expect(inputs.recipient).to.equal(bobAddress);
+      const content = decodeLockContent(await token.getLockContent(lockId));
+      expect(content).to.deep.equal({
+        selector: ethers.id(ERC20_LOCK_CONTENT_TYPE).slice(0, 10),
+        kind: LockKind.Transfer,
+        amount,
+        recipient: bobAddress,
+      });
+    });
+
+    it("should state the lock's content in ERC20LockCreated", async function () {
+      const amount = ethers.parseEther("200");
+      const tx = await token
+        .connect(alice)
+        .createLock(
+          encodeCreateLockInputs(amount, bobAddress),
+          ethers.ZeroHash,
+          ethers.ZeroHash,
+          "0x",
+        );
+      const lockId = await lockIdOf(token, tx);
+
+      await expect(tx)
+        .to.emit(token, "ERC20LockCreated")
+        .withArgs(lockId, aliceAddress, LockKind.Transfer, amount, bobAddress, "0x");
+    });
+
+    it("should revert when locking for transfer to the zero address", async function () {
+      await expect(
+        token
+          .connect(alice)
+          .createLock(
+            encodeCreateLockInputs(ethers.parseEther("1"), ethers.ZeroAddress),
+            ethers.ZeroHash,
+            ethers.ZeroHash,
+            "0x",
+          ),
+      ).to.be.revertedWithCustomError(token, "InvalidRecipient");
     });
 
     it("should revert when locking a zero amount", async function () {
@@ -335,6 +365,119 @@ describe("ERC20Lockable (ERC-8316 example)", function () {
 
       const lockInfo = await token.getLock(lockId);
       expect(lockInfo.spendCommitment).to.equal(newSpendCommitment);
+    });
+  });
+
+  describe("Burn locks", function () {
+    const amount = ethers.parseEther("300");
+    let lockId: string;
+    let tx: ContractTransactionResponse;
+
+    beforeEach(async function () {
+      tx = await token
+        .connect(alice)
+        .createBurnLock(amount, ethers.ZeroHash, ethers.ZeroHash, "0x");
+      lockId = await lockIdOf(token, tx);
+    });
+
+    it("should reserve the caller's balance, the caller owning the lock", async function () {
+      await expect(tx)
+        .to.emit(token, "ERC20LockCreated")
+        .withArgs(lockId, aliceAddress, LockKind.Burn, amount, ethers.ZeroAddress, "0x");
+      expect(await token.lockedBalanceOf(aliceAddress)).to.equal(amount);
+
+      const lockInfo = await token.getLock(lockId);
+      expect(lockInfo.owner).to.equal(aliceAddress);
+      expect(lockInfo.spender).to.equal(aliceAddress);
+
+      const content = decodeLockContent(await token.getLockContent(lockId));
+      expect([content.kind, content.amount, content.recipient]).to.deep.equal([
+        LockKind.Burn,
+        amount,
+        ethers.ZeroAddress,
+      ]);
+    });
+
+    it("should burn the reserved amount when spent by a delegated spender", async function () {
+      const supply = await token.totalSupply();
+
+      await token.connect(alice).delegateLock(lockId, "0x", charlieAddress, "0x");
+      await token.connect(charlie).spendLock(lockId, "0x", "0x");
+
+      expect(await token.balanceOf(aliceAddress)).to.equal(
+        ethers.parseEther("700"),
+      );
+      expect(await token.lockedBalanceOf(aliceAddress)).to.equal(0);
+      expect(await token.totalSupply()).to.equal(supply - amount);
+    });
+
+    it("should release the reservation when cancelled", async function () {
+      await token.connect(alice).cancelLock(lockId, "0x", "0x");
+
+      expect(await token.balanceOf(aliceAddress)).to.equal(
+        ethers.parseEther("1000"),
+      );
+      expect(await token.lockedBalanceOf(aliceAddress)).to.equal(0);
+    });
+
+    it("should reserve only the caller's unlocked balance", async function () {
+      await expect(
+        token
+          .connect(alice)
+          .createBurnLock(ethers.parseEther("701"), ethers.ZeroHash, ethers.ZeroHash, "0x"),
+      ).to.be.revertedWithCustomError(token, "ERC20InsufficientBalance");
+    });
+  });
+
+  describe("Mint locks", function () {
+    const amount = ethers.parseEther("50");
+    let ownerAddress: string;
+    let lockId: string;
+    let tx: ContractTransactionResponse;
+
+    beforeEach(async function () {
+      ownerAddress = await owner.getAddress();
+      tx = await token
+        .connect(owner)
+        .createMintLock(bobAddress, amount, ethers.ZeroHash, ethers.ZeroHash, "0x");
+      lockId = await lockIdOf(token, tx);
+    });
+
+    it("should fix the mint without reserving a balance", async function () {
+      await expect(tx)
+        .to.emit(token, "ERC20LockCreated")
+        .withArgs(lockId, ownerAddress, LockKind.Mint, amount, bobAddress, "0x");
+      expect(await token.lockedBalanceOf(ownerAddress)).to.equal(0);
+
+      const lockInfo = await token.getLock(lockId);
+      expect(lockInfo.owner).to.equal(ownerAddress);
+      expect(lockInfo.spender).to.equal(ownerAddress);
+    });
+
+    it("should mint to the recipient when spent", async function () {
+      const supply = await token.totalSupply();
+
+      await token.connect(owner).spendLock(lockId, "0x", "0x");
+
+      expect(await token.balanceOf(bobAddress)).to.equal(amount);
+      expect(await token.totalSupply()).to.equal(supply + amount);
+    });
+
+    it("should mint nothing when cancelled", async function () {
+      const supply = await token.totalSupply();
+
+      await token.connect(owner).cancelLock(lockId, "0x", "0x");
+
+      expect(await token.totalSupply()).to.equal(supply);
+      expect(await token.isLockActive(lockId)).to.equal(false);
+    });
+
+    it("should be created only by the token owner", async function () {
+      await expect(
+        token
+          .connect(bob)
+          .createMintLock(bobAddress, amount, ethers.ZeroHash, ethers.ZeroHash, "0x"),
+      ).to.be.revertedWithCustomError(token, "OwnableUnauthorizedAccount");
     });
   });
 });
